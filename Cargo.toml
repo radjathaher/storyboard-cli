@@ -1,6 +1,6 @@
 [package]
 name = "storyboard-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Describe local videos as reusable text storyboards with Gemini"
 repository = "https://github.com/radjathaher/storyboard-cli"

@@ -23,30 +23,73 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 #[command(
     name = "storyboard",
     version,
-    about = "Describe a local video as a reusable Gemini storyboard brief"
+    about = "Describe one local video as a reusable Gemini storyboard brief.",
+    long_about = r#"Describe one local video as a reusable Gemini storyboard brief.
+
+The CLI uploads the video with the Gemini Files API, waits for processing, asks Gemini for a recreation-focused brief, deletes the uploaded file best-effort, and prints normalized JSON on stdout. Progress, warnings, elapsed time, and estimated cost go to stderr."#,
+    after_help = r#"Examples:
+  storyboard ./video.mp4
+  storyboard ./video.mp4 --model gemini-3-flash-preview
+  storyboard ./video.mp4 --prompt "Focus on wardrobe and camera movement."
+  storyboard ./video.mp4 --media-resolution high --fps 2 --max-output-tokens 4096
+
+Auth:
+  Set GEMINI_API_KEY in the environment. No config file is read.
+
+Output contract:
+  stdout is JSON only: { description, usage, cost, elapsed_seconds }
+  stderr is human progress only: upload, polling, warnings, elapsed/cost summary.
+
+Model guidance:
+  Default is gemini-3.1-pro-preview for highest quality when quota is available.
+  If Pro quota is blocked, try --model gemini-3-flash-preview.
+  Unknown model pricing still works, but cost becomes null with a stderr warning.
+
+Video/detail guidance:
+  --media-resolution low     cheaper/lower visual detail; useful for long/simple videos.
+  --media-resolution medium  balanced detail/token use.
+  --media-resolution high    best visual detail; default for short ads/reels.
+  --media-resolution unspecified lets Gemini choose.
+
+  --fps controls how densely Gemini samples the video.
+  Lower fps (<1) is better for long/static videos.
+  Higher fps (2+) is better for fast cuts, motion, captions, and short ads.
+  Higher fps can increase tokens, cost, latency, and safety-trigger surface area.
+
+Docs:
+  Video:   https://ai.google.dev/gemini-api/docs/video-understanding
+  Models:  https://ai.google.dev/gemini-api/docs/models
+  Pricing: https://ai.google.dev/gemini-api/docs/pricing"#
 )]
 struct Cli {
     /// Local video file to describe.
+    #[arg(
+        value_name = "VIDEO",
+        long_help = "Exactly one local video file. Supported MIME types are detected from file bytes first, then common extensions like .mp4, .mov, and .webm as fallback. Remote URLs, directories, and batch inputs are intentionally not supported in v1."
+    )]
     video: PathBuf,
 
     /// Gemini model name.
-    #[arg(long, default_value = DEFAULT_MODEL)]
+    #[arg(long, default_value = DEFAULT_MODEL, long_help = "Gemini model id passed to generateContent. Default is gemini-3.1-pro-preview for high-quality recreation briefs. If your API key has no Pro quota, use gemini-3-flash-preview. The CLI does not fallback automatically because model/quota errors should be explicit.")]
     model: String,
 
     /// Gemini media resolution hint.
-    #[arg(long, value_enum, default_value_t = DEFAULT_MEDIA_RESOLUTION)]
+    #[arg(long, value_enum, default_value_t = DEFAULT_MEDIA_RESOLUTION, long_help = "Visual detail/token budget hint passed as generationConfig.mediaResolution. Use high for short visual ads/reels where captions, UI pages, wardrobe, and motion matter. Use medium/low for cheaper or longer videos. Use unspecified to let Gemini choose.")]
     media_resolution: MediaResolution,
 
     /// Video sampling FPS passed to Gemini.
-    #[arg(long, default_value_t = DEFAULT_FPS)]
+    #[arg(long, default_value_t = DEFAULT_FPS, long_help = "Frame sampling rate passed as videoMetadata.fps. Use lower values (<1) for long/static videos. Use 2+ for short fast-cut videos, motion, captions, UI pages, or detailed scene timing. Higher FPS can raise token usage, cost, latency, and safety-trigger surface area.")]
     fps: f64,
 
     /// Maximum output tokens.
-    #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_TOKENS)]
+    #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_TOKENS, long_help = "Maximum text tokens Gemini may generate. Raise this for long videos or very detailed timestamped briefs. Lower it for faster/cheaper summaries. If too low, the description may be truncated or less reusable.")]
     max_output_tokens: u32,
 
     /// Extra instruction appended to the default recreation prompt.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = r#"Extra instruction appended to the built-in recreation prompt. Use this to bias the brief without replacing the core storyboard structure. Example: --prompt "Focus on wardrobe, camera movement, captions, and edit pacing.""#
+    )]
     prompt: Option<String>,
 }
 
@@ -556,6 +599,17 @@ mod tests {
             normalize_gemini_error(raw).unwrap(),
             "UNAUTHENTICATED: API key invalid"
         );
+    }
+
+    #[test]
+    fn long_help_explains_usage_and_tradeoffs() {
+        use clap::CommandFactory;
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Output contract:"));
+        assert!(help.contains("Model guidance:"));
+        assert!(help.contains("--fps controls how densely Gemini samples"));
+        assert!(help.contains("https://ai.google.dev/gemini-api/docs/video-understanding"));
     }
 
     #[test]
