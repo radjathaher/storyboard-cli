@@ -24,6 +24,7 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
     name = "storyboard",
     version,
     about = "Describe one local video as a reusable Gemini storyboard brief.",
+    disable_help_flag = true,
     long_about = r#"Describe one local video as a reusable Gemini storyboard brief.
 
 The CLI uploads the video with the Gemini Files API, waits for processing, asks Gemini for a recreation-focused brief, deletes the uploaded file best-effort, and prints normalized JSON on stdout. Progress, warnings, elapsed time, and estimated cost go to stderr."#,
@@ -91,6 +92,9 @@ struct Cli {
         long_help = r#"Extra instruction appended to the built-in recreation prompt. Use this to bias the brief without replacing the core storyboard structure. Example: --prompt "Focus on wardrobe, camera movement, captions, and edit pacing.""#
     )]
     prompt: Option<String>,
+
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, help = "Print help")]
+    help: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
