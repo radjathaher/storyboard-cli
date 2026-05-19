@@ -1,0 +1,25 @@
+[package]
+name = "storyboard-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Describe local videos as reusable text storyboards with Gemini"
+repository = "https://github.com/radjathaher/storyboard-cli"
+license = "MIT"
+
+[[bin]]
+name = "storyboard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.27", features = ["derive"] }
+infer = "0.16.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.133"
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+httpmock = "0.7.0"
+predicates = "3.1.3"
+tempfile = "3.14.0"
