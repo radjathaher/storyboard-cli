@@ -8,35 +8,66 @@ on:
 permissions:
   contents: write
 
+env:
+  BIN_NAME: storyboard
+  ASSET_PREFIX: storyboard-cli
+
 jobs:
   build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            asset: darwin-aarch64
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            asset: linux-x86_64
-    runs-on: ${{ matrix.os }}
+          - target: darwin-aarch64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_target }}
+
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="storyboard-cli-${version}-${{ matrix.asset }}"
-          mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/storyboard" "dist/$name/storyboard"
-          cp README.md LICENSE "dist/$name/"
-          tar -czf "dist/$name.tar.gz" -C "dist/$name" .
-      - uses: softprops/action-gh-release@v2
+          mkdir -p dist
+          bin="target/${{ matrix.rust_target }}/release/${BIN_NAME}"
+          asset="${ASSET_PREFIX}-${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "dist/${asset}" -C "$(dirname "$bin")" "${BIN_NAME}"
+
+      - name: Upload asset
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/*.tar.gz
+          name: ${{ env.ASSET_PREFIX }}-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.tar.gz
+          generate_release_notes: true
