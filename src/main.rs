@@ -1,166 +1,146 @@
 use std::{
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::Parser;
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const DEFAULT_MODEL: &str = "gemini-3.1-pro-preview";
-const DEFAULT_MEDIA_RESOLUTION: MediaResolution = MediaResolution::High;
-const DEFAULT_FPS: f64 = 2.0;
+const DEFAULT_MODEL: &str = "google/gemini-2.5-flash";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
-const PRICING_SOURCE: &str = "https://ai.google.dev/gemini-api/docs/pricing";
-const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const DEFAULT_TEMPERATURE: f64 = 1.0;
+const DEFAULT_QUEUE_URL: &str = "https://queue.fal.run";
+const DEFAULT_REST_URL: &str = "https://rest.fal.ai";
+const DEFAULT_CDN_URL: &str = "https://v3.fal.media";
+const DEFAULT_CDN_FALLBACK_URL: &str = "https://fal.media";
+const ENDPOINT: &str = "openrouter/router/video";
+const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
+const MULTIPART_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "storyboard",
     version,
-    about = "Describe one local video as a reusable Gemini storyboard brief.",
+    about = "Describe one video as a reusable storyboard brief through fal OpenRouter video.",
     disable_help_flag = true,
-    long_about = r#"Describe one local video as a reusable Gemini storyboard brief.
+    long_about = r#"Describe one video as a reusable storyboard brief through fal's openrouter/router/video endpoint.
 
-The CLI uploads the video with the Gemini Files API, waits for processing, asks Gemini for a recreation-focused brief, deletes the uploaded file best-effort, and prints normalized JSON on stdout. Progress, warnings, elapsed time, and estimated cost go to stderr."#,
+The CLI accepts a local video file, public video URL, or public YouTube URL. Local files are uploaded to fal storage first. The selected Gemini-capable OpenRouter model analyzes the video and the CLI prints provider-shaped JSON on stdout. Progress and cost hints go to stderr."#,
     after_help = r#"Examples:
   storyboard ./video.mp4
-  storyboard ./video.mp4 --model gemini-3-flash-preview
+  storyboard https://example.com/video.mp4
+  storyboard https://www.youtube.com/watch?v=dQw4w9WgXcQ
+  storyboard ./video.mp4 --model google/gemini-3.1-pro-preview
   storyboard ./video.mp4 --prompt "Focus on wardrobe and camera movement."
-  storyboard ./video.mp4 --media-resolution high --fps 2 --max-output-tokens 4096
 
 Auth:
-  Set GEMINI_API_KEY in the environment. No config file is read.
+  Set FAL_KEY in the environment. The CLI also falls back to /run/secrets/FAL_KEY.
 
 Output contract:
-  stdout is JSON only: { description, usage, cost, elapsed_seconds }
-  stderr is human progress only: upload, polling, warnings, elapsed/cost summary.
+  stdout is JSON only: { provider, endpoint, request_id, model, input, output, usage, elapsed_seconds }
+  stderr is human progress only: upload, queue, polling, elapsed/cost summary.
 
 Model guidance:
-  Default is gemini-3.1-pro-preview for highest quality when quota is available.
-  If Pro quota is blocked, try --model gemini-3-flash-preview.
-  Unknown model pricing still works, but cost becomes null with a stderr warning.
+  Default is google/gemini-2.5-flash for low-cost storyboard and QA runs.
+  Use --model google/gemini-3.1-pro-preview when you need deeper visual reasoning.
 
-Video/detail guidance:
-  --media-resolution low     cheaper/lower visual detail; useful for long/simple videos.
-  --media-resolution medium  balanced detail/token use.
-  --media-resolution high    best visual detail; default for short ads/reels.
-  --media-resolution unspecified lets Gemini choose.
-
-  --fps controls how densely Gemini samples the video.
-  Lower fps (<1) is better for long/static videos.
-  Higher fps (2+) is better for fast cuts, motion, captions, and short ads.
-  Higher fps can increase tokens, cost, latency, and safety-trigger surface area.
+Pricing guidance:
+  fal bills this route by input/output tokens and returns authoritative cost in usage.cost.
+  Gemini video is tokenized at roughly 300 tokens/sec at default media resolution, or roughly 100 tokens/sec at low media resolution in Google's direct API docs. The fal route does not expose media_resolution/fps controls.
 
 Docs:
-  Video:   https://ai.google.dev/gemini-api/docs/video-understanding
-  Models:  https://ai.google.dev/gemini-api/docs/models
-  Pricing: https://ai.google.dev/gemini-api/docs/pricing"#
+  fal route: https://fal.ai/models/openrouter/router/video/api
+  Gemini video: https://ai.google.dev/gemini-api/docs/video-understanding
+  OpenRouter models: https://openrouter.ai/api/v1/models"#
 )]
 struct Cli {
-    /// Local video file to describe.
+    /// Local video path, public video URL, or public YouTube URL.
     #[arg(
-        value_name = "VIDEO",
-        long_help = "Exactly one local video file. Supported MIME types are detected from file bytes first, then common extensions like .mp4, .mov, and .webm as fallback. Remote URLs, directories, and batch inputs are intentionally not supported in v1."
+        value_name = "INPUT",
+        long_help = "Exactly one input. This can be a local video file (.mp4, .mov, .webm, .mpeg), a public video URL, or a public YouTube URL. Local files are uploaded to fal storage; URLs are passed directly to openrouter/router/video."
     )]
-    video: PathBuf,
+    input: String,
 
-    /// Gemini model name.
-    #[arg(long, default_value = DEFAULT_MODEL, long_help = "Gemini model id passed to generateContent. Default is gemini-3.1-pro-preview for high-quality recreation briefs. If your API key has no Pro quota, use gemini-3-flash-preview. The CLI does not fallback automatically because model/quota errors should be explicit.")]
+    /// OpenRouter model name routed through fal.
+    #[arg(long, default_value = DEFAULT_MODEL, long_help = "OpenRouter model id. Default is google/gemini-2.5-flash for low-cost storyboard/QA. Use google/gemini-3.1-pro-preview for higher quality at materially higher cost.")]
     model: String,
 
-    /// Gemini media resolution hint.
-    #[arg(long, value_enum, default_value_t = DEFAULT_MEDIA_RESOLUTION, long_help = "Visual detail/token budget hint passed as generationConfig.mediaResolution. Use high for short visual ads/reels where captions, UI pages, wardrobe, and motion matter. Use medium/low for cheaper or longer videos. Use unspecified to let Gemini choose.")]
-    media_resolution: MediaResolution,
-
-    /// Video sampling FPS passed to Gemini.
-    #[arg(long, default_value_t = DEFAULT_FPS, long_help = "Frame sampling rate passed as videoMetadata.fps. Use lower values (<1) for long/static videos. Use 2+ for short fast-cut videos, motion, captions, UI pages, or detailed scene timing. Higher FPS can raise token usage, cost, latency, and safety-trigger surface area.")]
-    fps: f64,
-
     /// Maximum output tokens.
-    #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_TOKENS, long_help = "Maximum text tokens Gemini may generate. Raise this for long videos or very detailed timestamped briefs. Lower it for faster/cheaper summaries. If too low, the description may be truncated or less reusable.")]
+    #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_TOKENS, long_help = "Maximum response tokens. Raise this for long videos or very detailed timestamped briefs. Lower it for faster/cheaper summaries.")]
     max_output_tokens: u32,
+
+    /// Sampling temperature passed to fal/OpenRouter.
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
+    temperature: f64,
 
     /// Extra instruction appended to the default recreation prompt.
     #[arg(
         long,
-        long_help = r#"Extra instruction appended to the built-in recreation prompt. Use this to bias the brief without replacing the core storyboard structure. Example: --prompt "Focus on wardrobe, camera movement, captions, and edit pacing.""#
+        long_help = r#"Extra instruction appended to the built-in recreation prompt. Example: --prompt "Focus on wardrobe, camera movement, captions, and edit pacing.""#
     )]
     prompt: Option<String>,
+
+    /// Queue poll interval in seconds.
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
+
+    /// Queue wait timeout in seconds.
+    #[arg(long, default_value_t = 1200)]
+    max_wait_secs: u64,
 
     #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, help = "Print help")]
     help: Option<bool>,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum MediaResolution {
-    Low,
-    Medium,
-    High,
-    Unspecified,
-}
-
-impl std::fmt::Display for MediaResolution {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Unspecified => "unspecified",
-        })
-    }
-}
-
-impl MediaResolution {
-    fn api_value(self) -> &'static str {
-        match self {
-            Self::Low => "MEDIA_RESOLUTION_LOW",
-            Self::Medium => "MEDIA_RESOLUTION_MEDIUM",
-            Self::High => "MEDIA_RESOLUTION_HIGH",
-            Self::Unspecified => "MEDIA_RESOLUTION_UNSPECIFIED",
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InputInfo {
+    kind: String,
+    source: String,
+    resolved_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct StoryboardOutput {
-    description: String,
-    usage: Usage,
-    cost: Option<Cost>,
+    provider: String,
+    endpoint: String,
+    request_id: String,
+    model: String,
+    input: InputInfo,
+    output: String,
+    usage: Value,
     elapsed_seconds: f64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
-struct Usage {
-    model: String,
-    prompt_token_count: u64,
-    candidates_token_count: u64,
-    thoughts_token_count: u64,
-    total_token_count: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct Cost {
-    currency: String,
-    input_usd: f64,
-    output_usd: f64,
-    total_usd: f64,
-    pricing_source: String,
+#[derive(Debug, Deserialize, Serialize)]
+struct QueueStatus {
+    status: String,
+    request_id: String,
+    #[serde(default)]
+    response_url: Option<String>,
+    #[serde(default)]
+    status_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FileResource {
-    name: String,
-    uri: String,
-    #[serde(default, rename = "mimeType")]
-    mime_type: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
+struct CdnToken {
+    token: String,
+    token_type: String,
+    base_url: String,
+}
+
+struct FalClient {
+    http: Client,
+    fal_key: String,
+    queue_url: String,
+    rest_url: String,
+    cdn_url: String,
+    cdn_fallback_url: String,
 }
 
 fn main() {
@@ -172,255 +152,432 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let started = Instant::now();
-    let api_key = env::var("GEMINI_API_KEY").context("GEMINI_API_KEY is required")?;
     validate_cli(&cli)?;
-
-    let mime_type = detect_mime(&cli.video)?;
-    eprintln!("uploading {} ({mime_type})", cli.video.display());
-
-    let client = GeminiClient::new(api_key)?;
-    let uploaded = client.upload_file(&cli.video, &mime_type)?;
-    eprintln!("uploaded {}; waiting for ACTIVE", uploaded.name);
-
-    let result = (|| -> Result<StoryboardOutput> {
-        let file = client.wait_active(&uploaded.name, Duration::from_secs(300))?;
-        eprintln!("generating storyboard with {}", cli.model);
-        let response = client.generate(&cli, &file)?;
-        let description = extract_description(&response)?;
-        let usage = extract_usage(&cli.model, &response);
-        let cost = estimate_cost(&usage);
-        if cost.is_none() {
-            eprintln!(
-                "warning: no baked pricing for model {}; cost set to null",
-                usage.model
-            );
-        }
-        Ok(StoryboardOutput {
-            description,
-            usage,
-            cost,
-            elapsed_seconds: round3(started.elapsed().as_secs_f64()),
-        })
-    })();
-
-    if let Err(err) = client.delete_file(&uploaded.name) {
-        eprintln!(
-            "warning: failed to delete uploaded file {}: {err:#}",
-            uploaded.name
-        );
-    } else {
-        eprintln!("deleted uploaded file {}", uploaded.name);
-    }
-
-    let output = result?;
+    let started = Instant::now();
+    let client = FalClient::new()?;
+    let output = generate_storyboard(&client, &cli, started)?;
     println!("{}", serde_json::to_string_pretty(&output)?);
     eprintln!(
         "done in {:.3}s{}",
         output.elapsed_seconds,
-        cost_summary(output.cost.as_ref())
+        cost_summary(&output.usage)
     );
     Ok(())
 }
 
+fn generate_storyboard(
+    client: &FalClient,
+    cli: &Cli,
+    started: Instant,
+) -> Result<StoryboardOutput> {
+    let input = resolve_input(client, &cli.input)?;
+    eprintln!("generating storyboard with {}", cli.model);
+    let body = json!({
+        "video_urls": [input.resolved_url],
+        "prompt": build_prompt(cli.prompt.as_deref()),
+        "model": cli.model,
+        "temperature": cli.temperature,
+        "max_tokens": cli.max_output_tokens,
+    });
+    let queued = client.submit(ENDPOINT, body)?;
+    eprintln!("queued {}; polling", queued.request_id);
+    let result = client.wait_result(
+        ENDPOINT,
+        &queued.request_id,
+        cli.max_wait_secs,
+        cli.poll_interval_secs,
+    )?;
+    let output = result
+        .get("output")
+        .and_then(Value::as_str)
+        .context("fal result missing output")?
+        .to_string();
+    let usage = result.get("usage").cloned().unwrap_or_else(|| json!({}));
+    Ok(StoryboardOutput {
+        provider: "fal-openrouter-video".to_string(),
+        endpoint: ENDPOINT.to_string(),
+        request_id: queued.request_id,
+        model: cli.model.clone(),
+        input,
+        output,
+        usage,
+        elapsed_seconds: round3(started.elapsed().as_secs_f64()),
+    })
+}
+
 fn validate_cli(cli: &Cli) -> Result<()> {
-    if !cli.video.is_file() {
-        bail!("video path must be a local file: {}", cli.video.display());
-    }
-    if cli.fps <= 0.0 || !cli.fps.is_finite() {
-        bail!("--fps must be a positive number");
+    if cli.input.trim().is_empty() {
+        bail!("input is required");
     }
     if cli.max_output_tokens == 0 {
         bail!("--max-output-tokens must be greater than 0");
     }
+    if !(0.0..=2.0).contains(&cli.temperature) || !cli.temperature.is_finite() {
+        bail!("--temperature must be between 0 and 2");
+    }
+    if !is_url(&cli.input) && !Path::new(&cli.input).is_file() {
+        bail!("input must be a local file or http(s) URL: {}", cli.input);
+    }
     Ok(())
 }
 
-fn detect_mime(path: &Path) -> Result<String> {
-    if let Some(kind) = infer::get_from_path(path).context("failed to inspect file type")? {
-        return Ok(kind.mime_type().to_string());
+fn resolve_input(client: &FalClient, input: &str) -> Result<InputInfo> {
+    if is_url(input) {
+        return Ok(InputInfo {
+            kind: "url".to_string(),
+            source: input.to_string(),
+            resolved_url: input.to_string(),
+        });
     }
-
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "mp4" | "m4v" => Ok("video/mp4".to_string()),
-        "mov" => Ok("video/quicktime".to_string()),
-        "webm" => Ok("video/webm".to_string()),
-        _ => bail!("could not detect video MIME type for {}", path.display()),
-    }
+    let path = PathBuf::from(input);
+    let mime_type = mime_for_path(&path);
+    eprintln!("uploading {} ({mime_type})", path.display());
+    let resolved_url = client.upload_file(&path)?;
+    Ok(InputInfo {
+        kind: "file".to_string(),
+        source: input.to_string(),
+        resolved_url,
+    })
 }
 
-struct GeminiClient {
-    client: Client,
-    api_key: String,
-    base_url: String,
-}
-
-impl GeminiClient {
-    fn new(api_key: String) -> Result<Self> {
-        let base_url =
-            env::var("GEMINI_API_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        Self::with_base_url(api_key, base_url)
+impl FalClient {
+    fn new() -> Result<Self> {
+        Self::with_key_and_urls(
+            read_secret("FAL_KEY")?,
+            env::var("FAL_QUEUE_URL").unwrap_or_else(|_| DEFAULT_QUEUE_URL.to_string()),
+            env::var("FAL_REST_URL").unwrap_or_else(|_| DEFAULT_REST_URL.to_string()),
+            env::var("FAL_CDN_URL").unwrap_or_else(|_| DEFAULT_CDN_URL.to_string()),
+            env::var("FAL_CDN_FALLBACK_URL")
+                .unwrap_or_else(|_| DEFAULT_CDN_FALLBACK_URL.to_string()),
+        )
     }
 
-    fn with_base_url(api_key: String, base_url: String) -> Result<Self> {
+    fn with_key_and_urls(
+        fal_key: String,
+        queue_url: String,
+        rest_url: String,
+        cdn_url: String,
+        cdn_fallback_url: String,
+    ) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
+            http: Client::builder()
+                .user_agent(concat!("storyboard-cli/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            api_key,
-            base_url,
+            fal_key,
+            queue_url,
+            rest_url,
+            cdn_url,
+            cdn_fallback_url,
         })
     }
 
-    fn upload_file(&self, path: &Path, mime_type: &str) -> Result<FileResource> {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let display_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("video");
-        let start_url = format!("{}/upload/v1beta/files?key={}", self.base_url, self.api_key);
-        let metadata = json!({ "file": { "display_name": display_name } });
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Goog-Upload-Protocol",
-            HeaderValue::from_static("resumable"),
-        );
-        headers.insert("X-Goog-Upload-Command", HeaderValue::from_static("start"));
-        headers.insert(
-            "X-Goog-Upload-Header-Content-Type",
-            HeaderValue::from_str(mime_type)?,
-        );
-        headers.insert(
-            "X-Goog-Upload-Header-Content-Length",
-            HeaderValue::from_str(&bytes.len().to_string())?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        let start = self
-            .client
-            .post(start_url)
-            .headers(headers)
-            .json(&metadata)
-            .send()
-            .context("failed to start resumable upload")?;
-        let start = ensure_success(start, "upload start")?;
-        let upload_url = start
-            .headers()
-            .get("X-Goog-Upload-URL")
-            .ok_or_else(|| anyhow!("upload start response missing X-Goog-Upload-URL"))?
-            .to_str()?
-            .to_string();
-
-        let finalize = self
-            .client
-            .post(upload_url)
-            .header("X-Goog-Upload-Offset", "0")
-            .header("X-Goog-Upload-Command", "upload, finalize")
-            .header(CONTENT_LENGTH, bytes.len())
-            .header(CONTENT_TYPE, mime_type)
-            .body(bytes)
-            .send()
-            .context("failed to finalize upload")?;
-        let body: Value = ensure_success(finalize, "upload finalize")?
-            .json()
-            .context("invalid upload finalize JSON")?;
-        parse_file(body)
+    fn auth_header(&self) -> String {
+        format!("Key {}", self.fal_key)
     }
 
-    fn wait_active(&self, name: &str, timeout: Duration) -> Result<FileResource> {
-        let deadline = Instant::now() + timeout;
+    fn bearer_header(&self) -> String {
+        format!("Bearer {}", self.fal_key)
+    }
+
+    fn cdn_token(&self) -> Result<CdnToken> {
+        let url = format!(
+            "{}/storage/auth/token?storage_type=fal-cdn-v3",
+            self.rest_url.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .post(url)
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&json!({}))
+            .send()?;
+        decode(res).and_then(|v| serde_json::from_value(v).context("decode CDN token"))
+    }
+
+    fn upload_file(&self, path: &Path) -> Result<String> {
+        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("upload.bin")
+            .to_string();
+        let content_type = mime_for_path(path);
+        let mut errors = Vec::new();
+        match self.upload_v3(&bytes, &name, content_type, path) {
+            Ok(url) => return Ok(url),
+            Err(err) => errors.push(format!("fal_v3: {err:#}")),
+        }
+        match self.upload_cdn(&bytes, &name, content_type) {
+            Ok(url) => return Ok(url),
+            Err(err) => errors.push(format!("cdn: {err:#}")),
+        }
+        match self.upload_storage(&bytes, &name, content_type) {
+            Ok(url) => return Ok(url),
+            Err(err) => errors.push(format!("storage: {err:#}")),
+        }
+        bail!("all fal upload methods failed: {}", errors.join(" | "))
+    }
+
+    fn upload_v3(
+        &self,
+        bytes: &[u8],
+        name: &str,
+        content_type: &str,
+        path: &Path,
+    ) -> Result<String> {
+        let token = self.cdn_token()?;
+        if fs::metadata(path)?.len() > MULTIPART_THRESHOLD {
+            return self.upload_v3_multipart(path, name, content_type, &token);
+        }
+        let url = format!("{}/files/upload", self.cdn_url.trim_end_matches('/'));
+        let res = self
+            .http
+            .post(url)
+            .header(
+                "Authorization",
+                format!("{} {}", token.token_type, token.token),
+            )
+            .header("Content-Type", content_type)
+            .header("X-Fal-File-Name", name)
+            .body(bytes.to_vec())
+            .send()?;
+        decode(res)?
+            .get("access_url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .context("v3 upload missing access_url")
+    }
+
+    fn upload_v3_multipart(
+        &self,
+        path: &Path,
+        name: &str,
+        content_type: &str,
+        token: &CdnToken,
+    ) -> Result<String> {
+        let auth = format!("{} {}", token.token_type, token.token);
+        let create_url = format!(
+            "{}/files/upload/multipart",
+            token.base_url.trim_end_matches('/')
+        );
+        let created = decode(
+            self.http
+                .post(create_url)
+                .header("Authorization", &auth)
+                .header("Accept", "application/json")
+                .header("Content-Type", content_type)
+                .header("X-Fal-File-Name", name)
+                .send()?,
+        )?;
+        let access_url = created
+            .get("access_url")
+            .and_then(Value::as_str)
+            .context("multipart missing access_url")?
+            .to_string();
+        let upload_id = created
+            .get("uploadId")
+            .and_then(Value::as_str)
+            .context("multipart missing uploadId")?
+            .to_string();
+        let size = fs::metadata(path)?.len();
+        let parts = size.div_ceil(MULTIPART_CHUNK_SIZE);
+        let mut file = fs::File::open(path)?;
+        let mut part_json = Vec::new();
+        for part in 1..=parts {
+            let start = (part - 1) * MULTIPART_CHUNK_SIZE;
+            file.seek(SeekFrom::Start(start))?;
+            let chunk_len = MULTIPART_CHUNK_SIZE.min(size - start) as usize;
+            let mut buf = vec![0u8; chunk_len];
+            file.read_exact(&mut buf)?;
+            let part_url = format!(
+                "{}/multipart/{}/{}",
+                access_url.trim_end_matches('/'),
+                upload_id,
+                part
+            );
+            let res = self
+                .http
+                .put(part_url)
+                .header("Authorization", &auth)
+                .header("Content-Type", content_type)
+                .header("Accept-Encoding", "identity")
+                .body(buf)
+                .send()?;
+            if !res.status().is_success() {
+                bail!("multipart part {} failed: http {}", part, res.status());
+            }
+            let etag = res
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .context("multipart part missing etag")?
+                .to_string();
+            part_json.push(json!({"partNumber": part, "etag": etag}));
+        }
+        let complete_url = format!(
+            "{}/multipart/{}/complete",
+            access_url.trim_end_matches('/'),
+            upload_id
+        );
+        decode(
+            self.http
+                .post(complete_url)
+                .header("Authorization", auth)
+                .json(&json!({"parts": part_json}))
+                .send()?,
+        )?;
+        Ok(access_url)
+    }
+
+    fn upload_cdn(&self, bytes: &[u8], name: &str, content_type: &str) -> Result<String> {
+        let url = format!(
+            "{}/files/upload",
+            self.cdn_fallback_url.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .post(url)
+            .header("Authorization", self.bearer_header())
+            .header("Content-Type", content_type)
+            .header("X-Fal-File-Name", name)
+            .body(bytes.to_vec())
+            .send()?;
+        decode(res)?
+            .get("access_url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .context("cdn upload missing access_url")
+    }
+
+    fn upload_storage(&self, bytes: &[u8], name: &str, content_type: &str) -> Result<String> {
+        let init_url = format!(
+            "{}/storage/upload/initiate?storage_type=gcs",
+            self.rest_url.trim_end_matches('/')
+        );
+        let init = decode(
+            self.http
+                .post(init_url)
+                .header("Authorization", self.auth_header())
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .json(&json!({"file_name": name, "content_type": content_type}))
+                .send()?,
+        )?;
+        let upload_url = init
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .context("storage missing upload_url")?;
+        let file_url = init
+            .get("file_url")
+            .and_then(Value::as_str)
+            .context("storage missing file_url")?
+            .to_string();
+        let res = self
+            .http
+            .put(upload_url)
+            .header("Content-Type", content_type)
+            .body(bytes.to_vec())
+            .send()?;
+        if !res.status().is_success() {
+            bail!("storage PUT failed: http {}", res.status());
+        }
+        Ok(file_url)
+    }
+
+    fn submit(&self, endpoint: &str, body: Value) -> Result<QueueStatus> {
+        let url = format!(
+            "{}/{}",
+            self.queue_url.trim_end_matches('/'),
+            endpoint.trim_matches('/')
+        );
+        let res = self
+            .http
+            .post(url)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .send()?;
+        decode(res).and_then(|v| serde_json::from_value(v).context("decode queue status"))
+    }
+
+    fn get_status(&self, endpoint: &str, request_id: &str) -> Result<Value> {
+        let url = format!(
+            "{}/{}/requests/{}/status",
+            self.queue_url.trim_end_matches('/'),
+            endpoint.trim_matches('/'),
+            request_id
+        );
+        decode(
+            self.http
+                .get(url)
+                .header("Authorization", self.auth_header())
+                .send()?,
+        )
+    }
+
+    fn get_result(&self, endpoint: &str, request_id: &str) -> Result<Value> {
+        let url = format!(
+            "{}/{}/requests/{}",
+            self.queue_url.trim_end_matches('/'),
+            endpoint.trim_matches('/'),
+            request_id
+        );
+        decode(
+            self.http
+                .get(url)
+                .header("Authorization", self.auth_header())
+                .send()?,
+        )
+    }
+
+    fn wait_result(
+        &self,
+        endpoint: &str,
+        request_id: &str,
+        max_wait_secs: u64,
+        poll_interval_secs: u64,
+    ) -> Result<Value> {
+        let start = Instant::now();
         loop {
-            let file = self.get_file(name)?;
-            match file.state.as_deref() {
-                Some("ACTIVE") => return Ok(file),
-                Some("FAILED") => bail!("uploaded file processing failed: {name}"),
-                state => eprintln!("file state: {}", state.unwrap_or("UNKNOWN")),
+            let status = self.get_status(endpoint, request_id)?;
+            match status.get("status").and_then(Value::as_str) {
+                Some("COMPLETED") => return self.get_result(endpoint, request_id),
+                Some("FAILED") => bail!("fal task failed: {}", status),
+                _ => {
+                    if start.elapsed() > Duration::from_secs(max_wait_secs) {
+                        bail!("timeout waiting for {request_id}");
+                    }
+                    thread::sleep(Duration::from_secs(poll_interval_secs.max(1)));
+                }
             }
-            if Instant::now() >= deadline {
-                bail!(
-                    "timed out waiting for uploaded file to become ACTIVE after {}s",
-                    timeout.as_secs()
-                );
-            }
-            thread::sleep(Duration::from_secs(1));
         }
     }
-
-    fn get_file(&self, name: &str) -> Result<FileResource> {
-        let url = format!("{}/v1beta/{}?key={}", self.base_url, name, self.api_key);
-        let response = self.client.get(url).send().context("failed to poll file")?;
-        let body: Value = ensure_success(response, "file poll")?
-            .json()
-            .context("invalid file poll JSON")?;
-        parse_file(body)
-    }
-
-    fn generate(&self, cli: &Cli, file: &FileResource) -> Result<Value> {
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.base_url, cli.model, self.api_key
-        );
-        let request = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    { "text": build_prompt(cli.prompt.as_deref()) },
-                    {
-                        "file_data": { "mime_type": file.mime_type.as_deref().unwrap_or("video/mp4"), "file_uri": file.uri },
-                        "video_metadata": { "fps": cli.fps }
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": cli.max_output_tokens,
-                "mediaResolution": cli.media_resolution.api_value()
-            }
-        });
-        let response = self
-            .client
-            .post(url)
-            .json(&request)
-            .send()
-            .context("failed to call generateContent")?;
-        ensure_success(response, "generateContent")?
-            .json()
-            .context("invalid generateContent JSON")
-    }
-
-    fn delete_file(&self, name: &str) -> Result<()> {
-        let url = format!("{}/v1beta/{}?key={}", self.base_url, name, self.api_key);
-        let response = self
-            .client
-            .delete(url)
-            .send()
-            .context("failed to delete file")?;
-        ensure_success(response, "file delete")?;
-        Ok(())
-    }
 }
 
-fn ensure_success(
-    response: reqwest::blocking::Response,
-    context: &str,
-) -> Result<reqwest::blocking::Response> {
-    if response.status().is_success() {
-        return Ok(response);
+fn decode(res: reqwest::blocking::Response) -> Result<Value> {
+    let status = res.status();
+    let text = res.text()?;
+    let parsed = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"raw": text}));
+    if !status.is_success() {
+        bail!("http {status}: {parsed}");
     }
-    let status = response.status();
-    let text = response.text().unwrap_or_default();
-    let message = normalize_gemini_error(&text).unwrap_or_else(|| text.trim().to_string());
-    bail!("{context} failed with HTTP {status}: {message}");
+    Ok(parsed)
 }
 
-fn parse_file(body: Value) -> Result<FileResource> {
-    let value = body.get("file").cloned().unwrap_or(body);
-    serde_json::from_value(value).context("invalid Gemini file resource")
+fn read_secret(name: &str) -> Result<String> {
+    if let Ok(v) = env::var(name) {
+        if !v.trim().is_empty() {
+            return Ok(v.trim().to_string());
+        }
+    }
+    let p = format!("/run/secrets/{name}");
+    if let Ok(v) = fs::read_to_string(&p) {
+        if !v.trim().is_empty() {
+            return Ok(v.trim().to_string());
+        }
+    }
+    bail!("{name} missing; set ${name} or /run/secrets/{name}")
 }
 
 fn build_prompt(extra: Option<&str>) -> String {
@@ -434,129 +591,72 @@ fn build_prompt(extra: Option<&str>) -> String {
     prompt
 }
 
-fn extract_description(response: &Value) -> Result<String> {
-    let parts = response
-        .pointer("/candidates/0/content/parts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("generateContent response missing candidate text"))?;
-    let text = parts
-        .iter()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        bail!("generateContent returned empty description");
-    }
-    Ok(text)
-}
-
-fn extract_usage(model: &str, response: &Value) -> Usage {
-    let metadata = response.get("usageMetadata").unwrap_or(&Value::Null);
-    Usage {
-        model: model.to_string(),
-        prompt_token_count: get_u64(metadata, "promptTokenCount"),
-        candidates_token_count: get_u64(metadata, "candidatesTokenCount"),
-        thoughts_token_count: get_u64(metadata, "thoughtsTokenCount"),
-        total_token_count: get_u64(metadata, "totalTokenCount"),
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => "video/mp4",
+        "mpeg" | "mpg" => "video/mpeg",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
     }
 }
 
-fn get_u64(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+fn is_url(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
 }
 
-fn estimate_cost(usage: &Usage) -> Option<Cost> {
-    let pricing = pricing_for_model(&usage.model)?;
-    let input_usd =
-        round6(usage.prompt_token_count as f64 / 1_000_000.0 * pricing.input_per_million);
-    let output_tokens = usage.candidates_token_count + usage.thoughts_token_count;
-    let output_usd = round6(output_tokens as f64 / 1_000_000.0 * pricing.output_per_million);
-    Some(Cost {
-        currency: "USD".to_string(),
-        input_usd,
-        output_usd,
-        total_usd: round6(input_usd + output_usd),
-        pricing_source: PRICING_SOURCE.to_string(),
-    })
-}
-
-struct Pricing {
-    input_per_million: f64,
-    output_per_million: f64,
-}
-
-fn pricing_for_model(model: &str) -> Option<Pricing> {
-    match model {
-        "gemini-3.1-pro-preview" => Some(Pricing {
-            input_per_million: 2.0,
-            output_per_million: 12.0,
-        }),
-        "gemini-3-pro-preview" => Some(Pricing {
-            input_per_million: 2.0,
-            output_per_million: 12.0,
-        }),
-        "gemini-2.5-pro" => Some(Pricing {
-            input_per_million: 1.25,
-            output_per_million: 10.0,
-        }),
-        "gemini-2.5-flash" => Some(Pricing {
-            input_per_million: 0.30,
-            output_per_million: 2.50,
-        }),
-        "gemini-2.5-flash-lite" => Some(Pricing {
-            input_per_million: 0.10,
-            output_per_million: 0.40,
-        }),
-        _ => None,
-    }
-}
-
-fn normalize_gemini_error(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    let error = value.get("error")?;
-    let status = error
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("UNKNOWN");
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("Gemini API error");
-    Some(format!("{status}: {message}"))
-}
-
-fn cost_summary(cost: Option<&Cost>) -> String {
-    match cost {
-        Some(cost) => format!("; estimated cost ${:.6}", cost.total_usd),
-        None => "; estimated cost unavailable".to_string(),
-    }
+fn cost_summary(usage: &Value) -> String {
+    usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .map(|cost| format!("; provider cost ${cost:.6}"))
+        .unwrap_or_else(|| "; provider cost unavailable".to_string())
 }
 
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
-fn round6(value: f64) -> f64 {
-    (value * 1_000_000.0).round() / 1_000_000.0
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use httpmock::prelude::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn test_client(server: &MockServer) -> FalClient {
+        FalClient::with_key_and_urls(
+            "test-key".to_string(),
+            server.base_url(),
+            server.base_url(),
+            server.base_url(),
+            server.base_url(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn cli_defaults_are_public_contract() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"not a real mp4").unwrap();
-        let cli = Cli::try_parse_from(["storyboard", file.path().to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from(["storyboard", "https://youtu.be/example"]).unwrap();
         assert_eq!(cli.model, DEFAULT_MODEL);
-        assert_eq!(cli.media_resolution.to_string(), "high");
-        assert_eq!(cli.fps, 2.0);
         assert_eq!(cli.max_output_tokens, 4096);
+        assert_eq!(cli.temperature, 1.0);
+    }
+
+    #[test]
+    fn validates_local_file_or_url_input() {
+        let cli = Cli::try_parse_from(["storyboard", "https://example.com/video.mp4"]).unwrap();
+        validate_cli(&cli).unwrap();
+
+        let cli = Cli::try_parse_from(["storyboard", "/definitely/missing.mp4"]).unwrap();
+        assert!(validate_cli(&cli).is_err());
     }
 
     #[test]
@@ -565,123 +665,153 @@ mod tests {
             (".mp4", "video/mp4"),
             (".mov", "video/quicktime"),
             (".webm", "video/webm"),
+            (".mpeg", "video/mpeg"),
         ] {
             let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
-            assert_eq!(detect_mime(file.path()).unwrap(), mime);
+            assert_eq!(mime_for_path(file.path()), mime);
         }
     }
 
     #[test]
-    fn pricing_uses_usage_metadata_tokens() {
-        let usage = Usage {
-            model: DEFAULT_MODEL.to_string(),
-            prompt_token_count: 1_000,
-            candidates_token_count: 2_000,
-            thoughts_token_count: 500,
-            total_token_count: 3_500,
-        };
-        let cost = estimate_cost(&usage).unwrap();
-        assert_eq!(cost.input_usd, 0.002);
-        assert_eq!(cost.output_usd, 0.03);
-        assert_eq!(cost.total_usd, 0.032);
+    fn prompt_appends_extra_instruction() {
+        let prompt = build_prompt(Some("Focus on racket motion."));
+        assert!(prompt.contains("video recreation brief"));
+        assert!(prompt.contains("Extra instruction: Focus on racket motion."));
     }
 
     #[test]
-    fn unknown_model_has_no_cost() {
-        let usage = Usage {
-            model: "custom-model".to_string(),
-            ..Usage::default()
-        };
-        assert!(estimate_cost(&usage).is_none());
-    }
-
-    #[test]
-    fn gemini_error_normalization_is_clear() {
-        let raw =
-            r#"{"error":{"code":401,"message":"API key invalid","status":"UNAUTHENTICATED"}}"#;
-        assert_eq!(
-            normalize_gemini_error(raw).unwrap(),
-            "UNAUTHENTICATED: API key invalid"
-        );
-    }
-
-    #[test]
-    fn long_help_explains_usage_and_tradeoffs() {
-        use clap::CommandFactory;
-
+    fn help_explains_fal_openrouter_and_pricing_shape() {
         let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("Output contract:"));
-        assert!(help.contains("Model guidance:"));
-        assert!(help.contains("--fps controls how densely Gemini samples"));
-        assert!(help.contains("https://ai.google.dev/gemini-api/docs/video-understanding"));
+        assert!(help.contains("fal's openrouter/router/video"));
+        assert!(help.contains("FAL_KEY"));
+        assert!(help.contains("usage.cost"));
+        assert!(help.contains("google/gemini-2.5-flash"));
     }
 
     #[test]
-    fn mocked_gemini_flow_outputs_normalized_json_and_deletes_file() {
+    fn direct_url_flow_outputs_provider_json() {
         let server = MockServer::start();
-        let upload_start = server.mock(|when, then| {
+        let submit = server.mock(|when, then| {
             when.method(POST)
-                .path("/upload/v1beta/files")
-                .query_param("key", "test-key");
-            then.status(200).header(
-                "X-Goog-Upload-URL",
-                &format!("{}/upload-session", server.base_url()),
-            );
-        });
-        let upload_finalize = server.mock(|when, then| {
-            when.method(POST).path("/upload-session");
-            then.status(200).json_body(json!({"file":{"name":"files/abc","uri":"https://files.local/abc","state":"PROCESSING"}}));
+                .path("/openrouter/router/video")
+                .header("authorization", "Key test-key")
+                .json_body_partial(r#"{"video_urls":["https://youtu.be/example"]}"#);
+            then.status(200).json_body(json!({
+                "status": "IN_QUEUE",
+                "request_id": "req-url"
+            }));
         });
         let poll = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1beta/files/abc")
-                .query_param("key", "test-key");
-            then.status(200).json_body(
-                json!({"name":"files/abc","uri":"https://files.local/abc","state":"ACTIVE"}),
-            );
-        });
-        let generate = server.mock(|when, then| {
-            when.method(POST).path(format!("/v1beta/models/{DEFAULT_MODEL}:generateContent")).query_param("key", "test-key");
+                .path("/openrouter/router/video/requests/req-url/status");
             then.status(200).json_body(json!({
-                "candidates":[{"content":{"parts":[{"text":"A detailed reconstruction brief."}]}}],
-                "usageMetadata":{"promptTokenCount":1000,"candidatesTokenCount":2000,"thoughtsTokenCount":0,"totalTokenCount":3000}
+                "status": "COMPLETED",
+                "request_id": "req-url"
             }));
         });
-        let delete = server.mock(|when, then| {
-            when.method(DELETE)
-                .path("/v1beta/files/abc")
-                .query_param("key", "test-key");
-            then.status(200).json_body(json!({}));
+        let result = server.mock(|when, then| {
+            when.method(GET).path("/openrouter/router/video/requests/req-url");
+            then.status(200).json_body(json!({
+                "output": "Shot-by-shot brief.",
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100, "cost": 0.0005}
+            }));
         });
 
-        let file = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
-        fs::write(file.path(), b"fake mp4").unwrap();
-
-        let cli = Cli::try_parse_from(["storyboard", file.path().to_str().unwrap()]).unwrap();
-        let client =
-            GeminiClient::with_base_url("test-key".to_string(), server.base_url()).unwrap();
-        let mime = detect_mime(file.path()).unwrap();
-        let uploaded = client.upload_file(file.path(), &mime).unwrap();
-        let active = client
-            .wait_active(&uploaded.name, Duration::from_secs(2))
-            .unwrap();
-        let response = client.generate(&cli, &active).unwrap();
-        client.delete_file(&uploaded.name).unwrap();
-
-        let json = StoryboardOutput {
-            description: extract_description(&response).unwrap(),
-            usage: extract_usage(&cli.model, &response),
-            cost: estimate_cost(&extract_usage(&cli.model, &response)),
-            elapsed_seconds: 0.0,
-        };
-        assert_eq!(json.description, "A detailed reconstruction brief.");
-        assert_eq!(json.usage.total_token_count, 3000);
-        assert_eq!(json.cost.unwrap().total_usd, 0.026);
-
-        upload_start.assert();
-        upload_finalize.assert();
+        let cli = Cli::try_parse_from([
+            "storyboard",
+            "https://youtu.be/example",
+            "--poll-interval-secs",
+            "1",
+            "--max-wait-secs",
+            "5",
+        ])
+        .unwrap();
+        let out = generate_storyboard(&test_client(&server), &cli, Instant::now()).unwrap();
+        assert_eq!(out.provider, "fal-openrouter-video");
+        assert_eq!(out.endpoint, ENDPOINT);
+        assert_eq!(out.request_id, "req-url");
+        assert_eq!(out.input.kind, "url");
+        assert_eq!(out.output, "Shot-by-shot brief.");
+        assert_eq!(out.usage.get("cost").and_then(Value::as_f64), Some(0.0005));
+        submit.assert();
         poll.assert();
-        generate.assert();
-        delete.assert();
+        result.assert();
+    }
+
+    #[test]
+    fn local_file_uploads_before_queue_submit() {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST)
+                .path("/storage/auth/token")
+                .query_param("storage_type", "fal-cdn-v3");
+            then.status(200).json_body(json!({
+                "token": "upload-token",
+                "token_type": "Bearer",
+                "base_url": server.base_url()
+            }));
+        });
+        let upload = server.mock(|when, then| {
+            when.method(POST)
+                .path("/files/upload")
+                .header("authorization", "Bearer upload-token")
+                .header("content-type", "video/mp4");
+            then.status(200).json_body(json!({
+                "access_url": "https://files.example/input.mp4"
+            }));
+        });
+        let submit = server.mock(|when, then| {
+            when.method(POST)
+                .path("/openrouter/router/video")
+                .json_body_partial(r#"{"video_urls":["https://files.example/input.mp4"]}"#);
+            then.status(200).json_body(json!({
+                "status": "IN_QUEUE",
+                "request_id": "req-file"
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/openrouter/router/video/requests/req-file/status");
+            then.status(200)
+                .json_body(json!({"status": "COMPLETED", "request_id": "req-file"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/openrouter/router/video/requests/req-file");
+            then.status(200).json_body(json!({
+                "output": "Uploaded file brief.",
+                "usage": {"cost": 0.001}
+            }));
+        });
+
+        let mut file = NamedTempFile::with_suffix(".mp4").unwrap();
+        file.write_all(b"fake mp4").unwrap();
+        let cli = Cli::try_parse_from(["storyboard", file.path().to_str().unwrap()]).unwrap();
+        let out = generate_storyboard(&test_client(&server), &cli, Instant::now()).unwrap();
+        assert_eq!(out.input.kind, "file");
+        assert_eq!(out.input.resolved_url, "https://files.example/input.mp4");
+        assert_eq!(out.output, "Uploaded file brief.");
+        token.assert();
+        upload.assert();
+        submit.assert();
+    }
+
+    #[test]
+    fn failed_queue_status_is_clear() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/openrouter/router/video");
+            then.status(200)
+                .json_body(json!({"status": "IN_QUEUE", "request_id": "req-fail"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/openrouter/router/video/requests/req-fail/status");
+            then.status(200)
+                .json_body(json!({"status": "FAILED", "detail": "bad input"}));
+        });
+        let cli = Cli::try_parse_from(["storyboard", "https://example.com/video.mp4"]).unwrap();
+        let err = generate_storyboard(&test_client(&server), &cli, Instant::now()).unwrap_err();
+        assert!(format!("{err:#}").contains("fal task failed"));
     }
 }
