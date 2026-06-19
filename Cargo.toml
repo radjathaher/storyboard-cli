@@ -1,6 +1,6 @@
 [package]
 name = "storyboard-cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Describe videos as reusable text storyboards through fal OpenRouter video"
 repository = "https://github.com/radjathaher/storyboard-cli"

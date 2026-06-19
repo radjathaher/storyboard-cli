@@ -117,7 +117,7 @@ struct StoryboardOutput {
     elapsed_seconds: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct QueueStatus {
     status: String,
     request_id: String,
@@ -180,13 +180,10 @@ fn generate_storyboard(
         "max_tokens": cli.max_output_tokens,
     });
     let queued = client.submit(ENDPOINT, body)?;
-    eprintln!("queued {}; polling", queued.request_id);
-    let result = client.wait_result(
-        ENDPOINT,
-        &queued.request_id,
-        cli.max_wait_secs,
-        cli.poll_interval_secs,
-    )?;
+    let request_id = queued.request_id.clone();
+    eprintln!("queued {request_id}; polling");
+    let result =
+        client.wait_result(ENDPOINT, &queued, cli.max_wait_secs, cli.poll_interval_secs)?;
     let output = result
         .get("output")
         .and_then(Value::as_str)
@@ -196,7 +193,7 @@ fn generate_storyboard(
     Ok(StoryboardOutput {
         provider: "fal-openrouter-video".to_string(),
         endpoint: ENDPOINT.to_string(),
-        request_id: queued.request_id,
+        request_id,
         model: cli.model.clone(),
         input,
         output,
@@ -501,13 +498,15 @@ impl FalClient {
         decode(res).and_then(|v| serde_json::from_value(v).context("decode queue status"))
     }
 
-    fn get_status(&self, endpoint: &str, request_id: &str) -> Result<Value> {
-        let url = format!(
-            "{}/{}/requests/{}/status",
-            self.queue_url.trim_end_matches('/'),
-            endpoint.trim_matches('/'),
-            request_id
-        );
+    fn get_status(&self, endpoint: &str, queued: &QueueStatus) -> Result<Value> {
+        let url = queued.status_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}/{}/requests/{}/status",
+                self.queue_url.trim_end_matches('/'),
+                queue_request_endpoint(endpoint),
+                queued.request_id
+            )
+        });
         decode(
             self.http
                 .get(url)
@@ -516,13 +515,15 @@ impl FalClient {
         )
     }
 
-    fn get_result(&self, endpoint: &str, request_id: &str) -> Result<Value> {
-        let url = format!(
-            "{}/{}/requests/{}",
-            self.queue_url.trim_end_matches('/'),
-            endpoint.trim_matches('/'),
-            request_id
-        );
+    fn get_result(&self, endpoint: &str, queued: &QueueStatus) -> Result<Value> {
+        let url = queued.response_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}/{}/requests/{}",
+                self.queue_url.trim_end_matches('/'),
+                queue_request_endpoint(endpoint),
+                queued.request_id
+            )
+        });
         decode(
             self.http
                 .get(url)
@@ -534,19 +535,19 @@ impl FalClient {
     fn wait_result(
         &self,
         endpoint: &str,
-        request_id: &str,
+        queued: &QueueStatus,
         max_wait_secs: u64,
         poll_interval_secs: u64,
     ) -> Result<Value> {
         let start = Instant::now();
         loop {
-            let status = self.get_status(endpoint, request_id)?;
+            let status = self.get_status(endpoint, queued)?;
             match status.get("status").and_then(Value::as_str) {
-                Some("COMPLETED") => return self.get_result(endpoint, request_id),
+                Some("COMPLETED") => return self.get_result(endpoint, queued),
                 Some("FAILED") => bail!("fal task failed: {}", status),
                 _ => {
                     if start.elapsed() > Duration::from_secs(max_wait_secs) {
-                        bail!("timeout waiting for {request_id}");
+                        bail!("timeout waiting for {}", queued.request_id);
                     }
                     thread::sleep(Duration::from_secs(poll_interval_secs.max(1)));
                 }
@@ -563,6 +564,13 @@ fn decode(res: reqwest::blocking::Response) -> Result<Value> {
         bail!("http {status}: {parsed}");
     }
     Ok(parsed)
+}
+
+fn queue_request_endpoint(endpoint: &str) -> &str {
+    endpoint
+        .trim_matches('/')
+        .strip_suffix("/video")
+        .unwrap_or(endpoint.trim_matches('/'))
 }
 
 fn read_secret(name: &str) -> Result<String> {
@@ -698,19 +706,21 @@ mod tests {
                 .json_body_partial(r#"{"video_urls":["https://youtu.be/example"]}"#);
             then.status(200).json_body(json!({
                 "status": "IN_QUEUE",
-                "request_id": "req-url"
+                "request_id": "req-url",
+                "status_url": format!("{}/openrouter/router/requests/req-url/status", server.base_url()),
+                "response_url": format!("{}/openrouter/router/requests/req-url", server.base_url())
             }));
         });
         let poll = server.mock(|when, then| {
             when.method(GET)
-                .path("/openrouter/router/video/requests/req-url/status");
+                .path("/openrouter/router/requests/req-url/status");
             then.status(200).json_body(json!({
                 "status": "COMPLETED",
                 "request_id": "req-url"
             }));
         });
         let result = server.mock(|when, then| {
-            when.method(GET).path("/openrouter/router/video/requests/req-url");
+            when.method(GET).path("/openrouter/router/requests/req-url");
             then.status(200).json_body(json!({
                 "output": "Shot-by-shot brief.",
                 "usage": {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100, "cost": 0.0005}
@@ -766,18 +776,20 @@ mod tests {
                 .json_body_partial(r#"{"video_urls":["https://files.example/input.mp4"]}"#);
             then.status(200).json_body(json!({
                 "status": "IN_QUEUE",
-                "request_id": "req-file"
+                "request_id": "req-file",
+                "status_url": format!("{}/openrouter/router/requests/req-file/status", server.base_url()),
+                "response_url": format!("{}/openrouter/router/requests/req-file", server.base_url())
             }));
         });
         server.mock(|when, then| {
             when.method(GET)
-                .path("/openrouter/router/video/requests/req-file/status");
+                .path("/openrouter/router/requests/req-file/status");
             then.status(200)
                 .json_body(json!({"status": "COMPLETED", "request_id": "req-file"}));
         });
         server.mock(|when, then| {
             when.method(GET)
-                .path("/openrouter/router/video/requests/req-file");
+                .path("/openrouter/router/requests/req-file");
             then.status(200).json_body(json!({
                 "output": "Uploaded file brief.",
                 "usage": {"cost": 0.001}
@@ -802,11 +814,15 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST).path("/openrouter/router/video");
             then.status(200)
-                .json_body(json!({"status": "IN_QUEUE", "request_id": "req-fail"}));
+                .json_body(json!({
+                    "status": "IN_QUEUE",
+                    "request_id": "req-fail",
+                    "status_url": format!("{}/openrouter/router/requests/req-fail/status", server.base_url())
+                }));
         });
         server.mock(|when, then| {
             when.method(GET)
-                .path("/openrouter/router/video/requests/req-fail/status");
+                .path("/openrouter/router/requests/req-fail/status");
             then.status(200)
                 .json_body(json!({"status": "FAILED", "detail": "bad input"}));
         });
